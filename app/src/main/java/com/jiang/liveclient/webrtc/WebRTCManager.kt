@@ -18,6 +18,7 @@ class WebRTCManager(
 ) {
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
+    private var eglBase: EglBase? = null
 
     private val _connectionState = MutableStateFlow("new")
     val connectionState: StateFlow<String> = _connectionState
@@ -44,7 +45,10 @@ class WebRTCManager(
             .createInitializationOptions()
         PeerConnectionFactory.initialize(options)
 
+        eglBase = EglBase.create()
         peerConnectionFactory = PeerConnectionFactory.builder()
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true))
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase!!.eglBaseContext))
             .createPeerConnectionFactory()
     }
 
@@ -79,14 +83,14 @@ class WebRTCManager(
                 }
                 Log.d(TAG, "startConnection: peerConnection created")
 
-                // Add sendrecv transceivers so server's sendrecv works with client's sendrecv
+                // Add recvonly transceivers - we only receive video/audio from server
                 peerConnection?.addTransceiver(
                     MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
-                    RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+                    RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
                 )
                 peerConnection?.addTransceiver(
                     MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
-                    RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+                    RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
                 )
 
                 var capturedSdp: SessionDescription? = null
@@ -219,10 +223,14 @@ class WebRTCManager(
 
             override fun onAddStream(stream: MediaStream?) {
                 Log.d(TAG, "onAddStream: $stream")
+                Log.d(TAG, "onAddStream: videoTracks class=${stream?.videoTracks?.javaClass?.name}, size=${stream?.videoTracks?.size}")
                 stream?.videoTracks?.firstOrNull()?.let {
+                    Log.d(TAG, "onAddStream: first videoTrack class=${it.javaClass.name}")
+                    Log.d(TAG, "onAddStream: setting remoteVideoTrack")
                     _remoteVideoTrack.value = it
-                }
+                } ?: Log.d(TAG, "onAddStream: videoTracks.firstOrNull() is null")
                 stream?.audioTracks?.firstOrNull()?.let {
+                    Log.d(TAG, "onAddStream: setting remoteAudioTrack")
                     _remoteAudioTrack.value = it
                 }
             }
@@ -236,13 +244,47 @@ class WebRTCManager(
             }
 
             override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {
-                Log.d(TAG, "onAddTrack: receiver=$receiver")
-                receiver?.track()?.let { track ->
-                    when (track) {
-                        is VideoTrack -> _remoteVideoTrack.value = track
-                        is AudioTrack -> _remoteAudioTrack.value = track
+                Log.d(TAG, "onAddTrack: receiver=$receiver, streams=${streams?.map { it.id }}")
+                val track = receiver?.track()
+                Log.d(TAG, "onAddTrack: track=${track}, track class=${track?.javaClass?.name}")
+                track?.let { t ->
+                    Log.d(TAG, "onAddTrack: track type=${t.javaClass.name}, kind=${t.kind()}")
+                    val trackKind = t.kind()
+                    if (trackKind == "video") {
+                        Log.d(TAG, "onAddTrack: adding frame monitoring to video track")
+                        val frameCounter = object : VideoSink {
+                            private var frameCount = 0
+                            private var lastLogTime = System.currentTimeMillis()
+                            override fun onFrame(frame: VideoFrame?) {
+                                frame?.let {
+                                    frameCount++
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastLogTime > 1000) {
+                                        Log.d(TAG, "VideoSink: received $frameCount frames in last second")
+                                        frameCount = 0
+                                        lastLogTime = now
+                                    }
+                                }
+                            }
+                        }
+                        val videoTrack = t as? VideoTrack
+                        if (videoTrack != null) {
+                            videoTrack.addSink(frameCounter)
+                            Log.d(TAG, "onAddTrack: setting VideoTrack")
+                            _remoteVideoTrack.value = videoTrack
+                        } else {
+                            Log.e(TAG, "onAddTrack: cannot cast to VideoTrack, track class=${t.javaClass.name}")
+                        }
+                    } else if (trackKind == "audio") {
+                        Log.d(TAG, "onAddTrack: setting AudioTrack")
+                        val audioTrack = t as? AudioTrack
+                        if (audioTrack != null) {
+                            _remoteAudioTrack.value = audioTrack
+                        }
+                    } else {
+                        Log.w(TAG, "onAddTrack: unknown track kind: $trackKind")
                     }
-                }
+                } ?: Log.d(TAG, "onAddTrack: track is null")
             }
         }
     }
@@ -256,9 +298,13 @@ class WebRTCManager(
         _sessionId.value = null
     }
 
+    fun getEglBaseContext(): EglBase.Context? = eglBase?.eglBaseContext
+
     fun release() {
         stopConnection()
         peerConnectionFactory?.dispose()
         peerConnectionFactory = null
+        eglBase?.release()
+        eglBase = null
     }
 }
